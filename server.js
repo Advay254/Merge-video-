@@ -115,26 +115,47 @@ async function getRandomBGM() {
   return path.join(BGM_DIR, randomFile);
 }
 
-// Helper: Execute FFmpeg command
-function executeFFmpeg(args) {
+// Helper: Execute FFmpeg command with timeout
+function executeFFmpeg(args, timeoutMs = 300000) { // 5 minute default timeout
   return new Promise((resolve, reject) => {
     const ffmpeg = spawn('ffmpeg', args);
     let stderr = '';
+    let killed = false;
+    
+    // Set timeout
+    const timeout = setTimeout(() => {
+      killed = true;
+      ffmpeg.kill('SIGKILL');
+      reject(new Error(`FFmpeg timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
     
     ffmpeg.stderr.on('data', (data) => {
       stderr += data.toString();
+      // Log progress for debugging
+      if (stderr.includes('time=')) {
+        const timeMatch = stderr.match(/time=(\d{2}:\d{2}:\d{2})/);
+        if (timeMatch) {
+          console.log(`FFmpeg progress: ${timeMatch[1]}`);
+        }
+      }
     });
     
     ffmpeg.on('close', (code) => {
+      clearTimeout(timeout);
+      if (killed) return; // Already rejected
+      
       if (code === 0) {
         resolve(stderr);
       } else {
-        reject(new Error(`FFmpeg failed: ${stderr}`));
+        reject(new Error(`FFmpeg failed with code ${code}: ${stderr}`));
       }
     });
     
     ffmpeg.on('error', (error) => {
-      reject(error);
+      clearTimeout(timeout);
+      if (!killed) {
+        reject(error);
+      }
     });
   });
 }
