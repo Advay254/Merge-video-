@@ -1,6 +1,6 @@
 FROM node:18-slim
 
-# Install FFmpeg and Whisper dependencies
+# Install FFmpeg and Python (without Whisper for faster builds)
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     python3 \
@@ -8,13 +8,13 @@ RUN apt-get update && apt-get install -y \
     python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Whisper in a virtual environment
-RUN python3 -m venv /opt/venv && \
-    /opt/venv/bin/pip install --upgrade pip && \
-    /opt/venv/bin/pip install openai-whisper
+# Optionally install Whisper (comment out to skip subtitles and speed up deployment)
+# RUN python3 -m venv /opt/venv && \
+#     /opt/venv/bin/pip install --upgrade pip && \
+#     /opt/venv/bin/pip install openai-whisper
 
-# Add virtual environment to PATH
-ENV PATH="/opt/venv/bin:$PATH"
+# Add virtual environment to PATH (if using Whisper)
+# ENV PATH="/opt/venv/bin:$PATH"
 
 # Create app directory
 WORKDIR /app
