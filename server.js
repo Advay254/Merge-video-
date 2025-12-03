@@ -199,30 +199,7 @@ async function extractThumbnail(videoPath, outputPath, timePercent = 0.3) {
 }
 
 // Helper: Generate subtitles with Whisper
-async function generateSubtitles(audioPath, outputSrtPath) {
-  return new Promise((resolve, reject) => {
-    const whisper = spawn('whisper', [
-      audioPath,
-      '--model', 'tiny',
-      '--output_format', 'srt',
-      '--output_dir', path.dirname(outputSrtPath)
-    ]);
-    
-    whisper.on('close', (code) => {
-      if (code === 0) {
-        resolve();
-      } else {
-        // Silently fail
-        resolve();
-      }
-    });
-    
-    whisper.on('error', () => {
-      // Silently fail
-      resolve();
-    });
-  });
-}
+// REMOVED - Whisper causes crashes and is not needed
 
 // Main processing function
 async function processVideo(job) {
@@ -255,26 +232,13 @@ async function processVideo(job) {
     job.progress = 20;
     await saveJob(job);
     
-    // Generate subtitles (skip if fails)
-    const srtPath = path.join(TEMP_DIR, `${jobId}.srt`);
-    try {
-      await Promise.race([
-        generateSubtitles(audioAPath, srtPath),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Subtitle timeout')), 30000))
-      ]);
-    } catch (error) {
-      console.log(`Subtitles skipped for job ${jobId}: ${error.message}`);
-    }
-    
-    job.progress = 30;
-    await saveJob(job);
-    
     // Get BGM
     const bgmPath = await getRandomBGM();
     
     // Mix audio
     const mixedAudioPath = path.join(TEMP_DIR, `${jobId}_mixed.aac`);
     if (bgmPath) {
+      console.log(`Job ${jobId}: Mixing audio with BGM`);
       await executeFFmpeg([
         '-i', audioAPath,
         '-i', bgmPath,
@@ -286,10 +250,11 @@ async function processVideo(job) {
         '-y'
       ]);
     } else {
+      console.log(`Job ${jobId}: No BGM found, using original audio`);
       await fs.copyFile(audioAPath, mixedAudioPath);
     }
     
-    job.progress = 40;
+    job.progress = 30;
     await saveJob(job);
     
     // Process videos based on layout
@@ -347,52 +312,34 @@ async function processVideo(job) {
       ]);
     }
     
+    console.log(`Job ${jobId}: Video merge complete`);
     job.progress = 60;
     await saveJob(job);
     
-    // Add subtitles if they exist
-    const tempWithSubsPath = path.join(TEMP_DIR, `${jobId}_subs.mp4`);
-    if (fsSync.existsSync(srtPath)) {
-      const srtEscaped = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:');
-      await executeFFmpeg([
-        '-i', tempMergedPath,
-        '-vf', `subtitles=${srtEscaped}`,
-        '-c:v', 'libx264',
-        '-preset', 'ultrafast',
-        '-crf', '28',
-        '-pix_fmt', 'yuv420p',
-        '-loglevel', 'error',
-        tempWithSubsPath,
-        '-y'
-      ]);
-    } else {
-      await fs.copyFile(tempMergedPath, tempWithSubsPath);
-    }
-    
-    job.progress = 75;
-    await saveJob(job);
-    
-    // Add watermark
+    // Add watermark and final audio
+    console.log(`Job ${jobId}: Adding watermark and audio`);
     const finalOutputPath = path.join(OUTPUT_DIR, `${jobId}_final.mp4`);
     await executeFFmpeg([
-      '-i', tempWithSubsPath,
+      '-i', tempMergedPath,
       '-i', mixedAudioPath,
       '-filter_complex',
-      `[0:v]drawtext=text='𝘼𝙙𝙫𝙖𝙮254':fontsize=24:fontcolor=white@0.6:x=w-tw-20:y=h-th-20:enable='between(t,0,${durationA})':box=1:boxcolor=black@0.3:boxborderw=5,rotate=10*PI/180:c=none:ow=rotw(10*PI/180):oh=roth(10*PI/180)[v]`,
+      `[0:v]drawtext=text='𝘼𝙙𝙫𝙖𝙮254':fontsize=24:fontcolor=white@0.6:x=w-tw-20:y=h-th-20:box=1:boxcolor=black@0.3:boxborderw=5,rotate=10*PI/180:c=none:ow=rotw(10*PI/180):oh=roth(10*PI/180)[v]`,
       '-map', '[v]',
       '-map', '1:a',
       '-c:v', 'libx264',
-      '-preset', 'ultrafast',
+      '-preset', 'veryfast',
       '-crf', '28',
       '-c:a', 'aac',
       '-b:a', '128k',
       '-pix_fmt', 'yuv420p',
-      '-loglevel', 'error',
+      '-loglevel', 'warning',
+      '-stats',
       finalOutputPath,
       '-y'
     ]);
     
-    job.progress = 90;
+    console.log(`Job ${jobId}: Watermark complete`);
+    job.progress = 80;
     await saveJob(job);
     
     // Extract thumbnail
@@ -458,9 +405,7 @@ async function processVideo(job) {
       videoBPath,
       audioAPath,
       mixedAudioPath,
-      tempMergedPath,
-      tempWithSubsPath,
-      srtPath
+      tempMergedPath
     ];
     
     for (const file of tempFiles) {
@@ -474,6 +419,7 @@ async function processVideo(job) {
     }
     
   } catch (error) {
+    console.error(`Job ${jobId} failed:`, error);
     job.status = 'failed';
     job.error = error.message;
     await saveJob(job);
