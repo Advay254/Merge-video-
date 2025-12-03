@@ -247,6 +247,7 @@ async function processVideo(job) {
       '-i', videoAPath,
       '-vn',
       '-acodec', 'aac',
+      '-loglevel', 'error',
       audioAPath,
       '-y'
     ]);
@@ -254,9 +255,16 @@ async function processVideo(job) {
     job.progress = 20;
     await saveJob(job);
     
-    // Generate subtitles
+    // Generate subtitles (skip if fails)
     const srtPath = path.join(TEMP_DIR, `${jobId}.srt`);
-    await generateSubtitles(audioAPath, srtPath);
+    try {
+      await Promise.race([
+        generateSubtitles(audioAPath, srtPath),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Subtitle timeout')), 30000))
+      ]);
+    } catch (error) {
+      console.log(`Subtitles skipped for job ${jobId}: ${error.message}`);
+    }
     
     job.progress = 30;
     await saveJob(job);
@@ -273,6 +281,7 @@ async function processVideo(job) {
         '-filter_complex',
         `[0:a]volume=1.0[a0];[1:a]volume=0.25[a1];[a0][a1]amix=inputs=2:duration=first`,
         '-ac', '2',
+        '-loglevel', 'error',
         mixedAudioPath,
         '-y'
       ]);
@@ -306,9 +315,10 @@ async function processVideo(job) {
         '-map', '[v]',
         '-t', durationA.toString(),
         '-c:v', 'libx264',
-        '-preset', 'fast',
-        '-crf', '23',
+        '-preset', 'ultrafast',
+        '-crf', '28',
         '-pix_fmt', 'yuv420p',
+        '-loglevel', 'error',
         tempMergedPath,
         '-y'
       ]);
@@ -328,9 +338,10 @@ async function processVideo(job) {
         '-map', '[v]',
         '-t', durationA.toString(),
         '-c:v', 'libx264',
-        '-preset', 'fast',
-        '-crf', '23',
+        '-preset', 'ultrafast',
+        '-crf', '28',
         '-pix_fmt', 'yuv420p',
+        '-loglevel', 'error',
         tempMergedPath,
         '-y'
       ]);
@@ -347,9 +358,10 @@ async function processVideo(job) {
         '-i', tempMergedPath,
         '-vf', `subtitles=${srtEscaped}`,
         '-c:v', 'libx264',
-        '-preset', 'fast',
-        '-crf', '23',
+        '-preset', 'ultrafast',
+        '-crf', '28',
         '-pix_fmt', 'yuv420p',
+        '-loglevel', 'error',
         tempWithSubsPath,
         '-y'
       ]);
@@ -370,11 +382,12 @@ async function processVideo(job) {
       '-map', '[v]',
       '-map', '1:a',
       '-c:v', 'libx264',
-      '-preset', 'fast',
-      '-crf', '23',
+      '-preset', 'ultrafast',
+      '-crf', '28',
       '-c:a', 'aac',
-      '-b:a', '192k',
+      '-b:a', '128k',
       '-pix_fmt', 'yuv420p',
+      '-loglevel', 'error',
       finalOutputPath,
       '-y'
     ]);
@@ -389,18 +402,15 @@ async function processVideo(job) {
     // Get final metadata
     const finalMetadata = await getMetadata(finalOutputPath);
     
-    // Convert to base64
-    const videoBuffer = await fs.readFile(finalOutputPath);
-    const videoBase64 = videoBuffer.toString('base64');
-    
-    const thumbBuffer = await fs.readFile(thumbnailPath);
-    const thumbBase64 = thumbBuffer.toString('base64');
-    
     // Read subtitle text
     let subtitleText = '';
     if (fsSync.existsSync(srtPath)) {
       subtitleText = await fs.readFile(srtPath, 'utf8');
     }
+    
+    // Convert only thumbnail to base64 (small file)
+    const thumbBuffer = await fs.readFile(thumbnailPath);
+    const thumbBase64 = thumbBuffer.toString('base64');
     
     // Update job with results
     job.status = 'completed';
@@ -408,7 +418,6 @@ async function processVideo(job) {
     job.completed_at = new Date().toISOString();
     job.result = {
       video_url: `/download/${jobId}_final.mp4`,
-      video_base64: videoBase64,
       metadata: finalMetadata,
       thumbnail_base64: thumbBase64,
       thumbnail_url: `/download/${jobId}_thumb.jpg`,
