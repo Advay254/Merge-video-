@@ -39,10 +39,33 @@ const jobQueue = new Map();
 async function loadJobs() {
   try {
     const files = await fs.readdir(JOBS_DIR);
+    const oneMinuteAgo = Date.now() - 60000;
+    
     for (const file of files) {
       if (file.endsWith('.json')) {
-        const data = await fs.readFile(path.join(JOBS_DIR, file), 'utf8');
+        const filePath = path.join(JOBS_DIR, file);
+        const data = await fs.readFile(filePath, 'utf8');
         const job = JSON.parse(data);
+        
+        // Check if job is completed and older than 1 minute
+        if (job.status === 'completed' && job.completed_at) {
+          const completedTime = new Date(job.completed_at).getTime();
+          if (completedTime < oneMinuteAgo) {
+            // Delete old completed job files
+            const jobId = job.job_id;
+            const videoPath = path.join(OUTPUT_DIR, `${jobId}_final.mp4`);
+            const thumbPath = path.join(OUTPUT_DIR, `${jobId}_thumb.jpg`);
+            
+            if (fsSync.existsSync(videoPath)) await fs.unlink(videoPath);
+            if (fsSync.existsSync(thumbPath)) await fs.unlink(thumbPath);
+            if (fsSync.existsSync(filePath)) await fs.unlink(filePath);
+            
+            console.log(`Startup cleanup: Deleted old job ${jobId}`);
+            continue;
+          }
+        }
+        
+        // Load job into queue
         jobQueue.set(job.job_id, job);
       }
     }
@@ -382,6 +405,7 @@ async function processVideo(job) {
     // Update job with results
     job.status = 'completed';
     job.progress = 100;
+    job.completed_at = new Date().toISOString();
     job.result = {
       video_url: `/download/${jobId}_final.mp4`,
       video_base64: videoBase64,
@@ -392,6 +416,32 @@ async function processVideo(job) {
     };
     
     await saveJob(job);
+    
+    // Schedule auto-deletion after 1 minute
+    setTimeout(async () => {
+      try {
+        // Delete output files
+        if (fsSync.existsSync(finalOutputPath)) {
+          await fs.unlink(finalOutputPath);
+        }
+        if (fsSync.existsSync(thumbnailPath)) {
+          await fs.unlink(thumbnailPath);
+        }
+        
+        // Delete job metadata
+        const jobFilePath = path.join(JOBS_DIR, `${jobId}.json`);
+        if (fsSync.existsSync(jobFilePath)) {
+          await fs.unlink(jobFilePath);
+        }
+        
+        // Remove from memory
+        jobQueue.delete(jobId);
+        
+        console.log(`Auto-deleted files for job ${jobId}`);
+      } catch (error) {
+        console.error(`Error auto-deleting job ${jobId}:`, error);
+      }
+    }, 60000); // 60000ms = 1 minute
     
     // Cleanup temp files
     const tempFiles = [
