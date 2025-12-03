@@ -10,6 +10,10 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Configuration
+const MAX_VIDEO_DURATION = 300; // 5 minutes in seconds
+const SEGMENT_DURATION = 300; // 5 minutes per part
+
 // Middleware
 app.use(express.json({ limit: '500mb' }));
 app.use(express.urlencoded({ extended: true, limit: '500mb' }));
@@ -222,7 +226,308 @@ async function extractThumbnail(videoPath, outputPath, timePercent = 0.3) {
 // Helper: Generate subtitles with Whisper
 // REMOVED - Whisper causes crashes and is not needed
 
-// Main processing function
+// Helper: Split video into segments
+async function splitVideoIntoSegments(videoPath, duration, jobId) {
+  const segments = [];
+  const numSegments = Math.ceil(duration / SEGMENT_DURATION);
+  
+  for (let i = 0; i < numSegments; i++) {
+    const startTime = i * SEGMENT_DURATION;
+    const segmentDuration = Math.min(SEGMENT_DURATION, duration - startTime);
+    const segmentPath = path.join(TEMP_DIR, `${jobId}_segment_${i}.mp4`);
+    
+    await executeFFmpeg([
+      '-ss', startTime.toString(),
+      '-i', videoPath,
+      '-t', segmentDuration.toString(),
+      '-c', 'copy',
+      '-avoid_negative_ts', '1',
+      '-loglevel', 'error',
+      segmentPath,
+      '-y'
+    ], 120000); // 2 minute timeout for splitting
+    
+    segments.push({
+      index: i,
+      path: segmentPath,
+      startTime: startTime,
+      duration: segmentDuration
+    });
+  }
+  
+  return segments;
+}
+
+// Main processing function with segment support
+async function processVideoSegments(job) {
+  const jobId = job.job_id;
+  const layout = job.layout;
+  const videoAPath = job.videoA_path;
+  const videoBPath = job.videoB_path;
+  
+  try {
+    job.status = 'processing';
+    job.progress = 5;
+    await saveJob(job);
+    
+    // Get metadata for Video A
+    const metadataA = await getMetadata(videoAPath);
+    const durationA = metadataA.duration;
+    
+    console.log(`Job ${jobId}: Video A duration: ${durationA}s`);
+    
+    // Check if we need to split
+    const needsSplitting = durationA > MAX_VIDEO_DURATION;
+    
+    if (needsSplitting) {
+      console.log(`Job ${jobId}: Video exceeds ${MAX_VIDEO_DURATION}s, splitting into segments`);
+      
+      // Split Video A into segments
+      job.progress = 10;
+      job.status_message = 'Splitting video into parts...';
+      await saveJob(job);
+      
+      const segmentsA = await splitVideoIntoSegments(videoAPath, durationA, `${jobId}_A`);
+      const numSegments = segmentsA.length;
+      
+      console.log(`Job ${jobId}: Split into ${numSegments} segments`);
+      
+      // Process each segment
+      const results = [];
+      
+      for (let i = 0; i < numSegments; i++) {
+        const segment = segmentsA[i];
+        const partNumber = i + 1;
+        const progressBase = 10 + (i / numSegments) * 85;
+        
+        console.log(`Job ${jobId}: Processing part ${partNumber}/${numSegments}`);
+        
+        job.progress = Math.round(progressBase);
+        job.status_message = `Processing part ${partNumber}/${numSegments}...`;
+        await saveJob(job);
+        
+        // Process this segment
+        const result = await processVideoSegment(
+          jobId,
+          segment,
+          videoBPath,
+          layout,
+          partNumber,
+          progressBase
+        );
+        
+        results.push(result);
+        
+        // Delete segment immediately after processing to save space
+        try {
+          await fs.unlink(segment.path);
+        } catch (e) {
+          console.error(`Failed to delete segment ${segment.path}`);
+        }
+      }
+      
+      // Job complete with multiple parts
+      job.status = 'completed';
+      job.progress = 100;
+      job.completed_at = new Date().toISOString();
+      job.result = {
+        split: true,
+        total_parts: numSegments,
+        parts: results,
+        original_duration: durationA
+      };
+      
+      await saveJob(job);
+      
+      // Schedule auto-deletion for all parts
+      setTimeout(async () => {
+        try {
+          for (const result of results) {
+            const videoPath = path.join(OUTPUT_DIR, `${jobId}_part${result.part_number}_final.mp4`);
+            const thumbPath = path.join(OUTPUT_DIR, `${jobId}_part${result.part_number}_thumb.jpg`);
+            
+            if (fsSync.existsSync(videoPath)) await fs.unlink(videoPath);
+            if (fsSync.existsSync(thumbPath)) await fs.unlink(thumbPath);
+          }
+          
+          const jobFilePath = path.join(JOBS_DIR, `${jobId}.json`);
+          if (fsSync.existsSync(jobFilePath)) await fs.unlink(jobFilePath);
+          
+          jobQueue.delete(jobId);
+          console.log(`Auto-deleted all parts for job ${jobId}`);
+        } catch (error) {
+          console.error(`Error auto-deleting job ${jobId}:`, error);
+        }
+      }, 60000);
+      
+    } else {
+      // Process as single video (existing logic)
+      await processVideo(job);
+    }
+    
+    // Cleanup input files
+    try {
+      if (fsSync.existsSync(videoAPath)) await fs.unlink(videoAPath);
+      if (fsSync.existsSync(videoBPath)) await fs.unlink(videoBPath);
+    } catch (e) {
+      console.error(`Failed to cleanup input files`);
+    }
+    
+  } catch (error) {
+    console.error(`Job ${jobId} failed:`, error);
+    job.status = 'failed';
+    job.error = error.message;
+    await saveJob(job);
+  }
+}
+
+// Process a single segment
+async function processVideoSegment(jobId, segmentA, videoBPath, layout, partNumber, progressBase) {
+  const segmentId = `${jobId}_part${partNumber}`;
+  
+  try {
+    console.log(`Segment ${segmentId}: Starting processing`);
+    
+    // Extract audio from segment
+    const audioAPath = path.join(TEMP_DIR, `${segmentId}_audioA.aac`);
+    await executeFFmpeg([
+      '-i', segmentA.path,
+      '-vn',
+      '-acodec', 'aac',
+      '-loglevel', 'error',
+      audioAPath,
+      '-y'
+    ], 120000);
+    
+    // Get BGM
+    const bgmPath = await getRandomBGM();
+    
+    // Mix audio
+    const mixedAudioPath = path.join(TEMP_DIR, `${segmentId}_mixed.aac`);
+    if (bgmPath) {
+      await executeFFmpeg([
+        '-i', audioAPath,
+        '-i', bgmPath,
+        '-filter_complex',
+        `[0:a]volume=1.0[a0];[1:a]volume=0.25[a1];[a0][a1]amix=inputs=2:duration=first`,
+        '-ac', '2',
+        '-loglevel', 'error',
+        mixedAudioPath,
+        '-y'
+      ], 120000);
+    } else {
+      await fs.copyFile(audioAPath, mixedAudioPath);
+    }
+    
+    // Merge videos
+    const tempMergedPath = path.join(TEMP_DIR, `${segmentId}_merged.mp4`);
+    const outputWidth = 1080;
+    const outputHeight = 1920;
+    
+    if (layout === 'A_top_B_bottom') {
+      const halfHeight = outputHeight / 2;
+      
+      await executeFFmpeg([
+        '-i', segmentA.path,
+        '-i', videoBPath,
+        '-filter_complex',
+        `[0:v]scale=${outputWidth}:${halfHeight}:force_original_aspect_ratio=decrease,pad=${outputWidth}:${halfHeight}:(ow-iw)/2:(oh-ih)/2[top];` +
+        `[1:v]scale=${outputWidth}:${halfHeight}:force_original_aspect_ratio=decrease,pad=${outputWidth}:${halfHeight}:(ow-iw)/2:(oh-ih)/2,` +
+        `loop=loop=-1:size=1:start=0,setpts=N/FRAME_RATE/TB[bottom_loop];` +
+        `[top][bottom_loop]vstack=inputs=2[stacked];` +
+        `[stacked]trim=duration=${segmentA.duration}[v]`,
+        '-map', '[v]',
+        '-t', segmentA.duration.toString(),
+        '-c:v', 'libx264',
+        '-preset', 'veryfast',
+        '-crf', '28',
+        '-pix_fmt', 'yuv420p',
+        '-loglevel', 'warning',
+        tempMergedPath,
+        '-y'
+      ], 300000); // 5 min timeout per segment
+    } else if (layout === 'A_left_B_right') {
+      const halfWidth = outputWidth / 2;
+      
+      await executeFFmpeg([
+        '-i', segmentA.path,
+        '-i', videoBPath,
+        '-filter_complex',
+        `[0:v]scale=${halfWidth}:${outputHeight}:force_original_aspect_ratio=decrease,pad=${halfWidth}:${outputHeight}:(ow-iw)/2:(oh-ih)/2[left];` +
+        `[1:v]scale=${halfWidth}:${outputHeight}:force_original_aspect_ratio=decrease,pad=${halfWidth}:${outputHeight}:(ow-iw)/2:(oh-ih)/2,` +
+        `loop=loop=-1:size=1:start=0,setpts=N/FRAME_RATE/TB[right_loop];` +
+        `[left][right_loop]hstack=inputs=2[stacked];` +
+        `[stacked]trim=duration=${segmentA.duration}[v]`,
+        '-map', '[v]',
+        '-t', segmentA.duration.toString(),
+        '-c:v', 'libx264',
+        '-preset', 'veryfast',
+        '-crf', '28',
+        '-pix_fmt', 'yuv420p',
+        '-loglevel', 'warning',
+        tempMergedPath,
+        '-y'
+      ], 300000);
+    }
+    
+    // Add watermark
+    const finalOutputPath = path.join(OUTPUT_DIR, `${segmentId}_final.mp4`);
+    await executeFFmpeg([
+      '-i', tempMergedPath,
+      '-i', mixedAudioPath,
+      '-filter_complex',
+      `[0:v]drawtext=text='𝘼𝙙𝙫𝙖𝙮254':fontsize=24:fontcolor=white@0.6:x=w-tw-20:y=h-th-20:box=1:boxcolor=black@0.3:boxborderw=5,rotate=10*PI/180:c=none:ow=rotw(10*PI/180):oh=roth(10*PI/180)[v]`,
+      '-map', '[v]',
+      '-map', '1:a',
+      '-c:v', 'libx264',
+      '-preset', 'veryfast',
+      '-crf', '28',
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      '-pix_fmt', 'yuv420p',
+      '-loglevel', 'warning',
+      finalOutputPath,
+      '-y'
+    ], 120000);
+    
+    // Extract thumbnail
+    const thumbnailPath = path.join(OUTPUT_DIR, `${segmentId}_thumb.jpg`);
+    await extractThumbnail(segmentA.path, thumbnailPath);
+    
+    // Get metadata
+    const finalMetadata = await getMetadata(finalOutputPath);
+    
+    // Convert thumbnail to base64
+    const thumbBuffer = await fs.readFile(thumbnailPath);
+    const thumbBase64 = thumbBuffer.toString('base64');
+    
+    // Cleanup temp files for this segment
+    const tempFiles = [audioAPath, mixedAudioPath, tempMergedPath];
+    for (const file of tempFiles) {
+      try {
+        if (fsSync.existsSync(file)) await fs.unlink(file);
+      } catch (e) {}
+    }
+    
+    console.log(`Segment ${segmentId}: Complete`);
+    
+    return {
+      part_number: partNumber,
+      video_url: `/download/${segmentId}_final.mp4`,
+      metadata: finalMetadata,
+      thumbnail_base64: thumbBase64,
+      thumbnail_url: `/download/${segmentId}_thumb.jpg`,
+      start_time: segmentA.startTime,
+      duration: segmentA.duration
+    };
+    
+  } catch (error) {
+    console.error(`Segment ${segmentId} failed:`, error);
+    throw error;
+  }
+}
+
+// Main processing function (existing logic for videos under 5 minutes)
 async function processVideo(job) {
   const jobId = job.job_id;
   const layout = job.layout;
@@ -530,7 +835,7 @@ app.post('/api/process', upload.fields([
     await saveJob(job);
     
     // Start processing asynchronously
-    processVideo(job);
+    processVideoSegments(job);
     
     res.json({ job_id: jobId });
     
