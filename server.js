@@ -120,8 +120,9 @@ async function getRandomBGM() {
 }
 
 // Helper: Execute FFmpeg command with timeout
-function executeFFmpeg(args, timeoutMs = 300000) { // 5 minute default timeout
+function executeFFmpeg(args, timeoutMs = 180000) { // 3 minute default timeout
   return new Promise((resolve, reject) => {
+    console.log(`FFmpeg command: ffmpeg ${args.join(' ')}`);
     const ffmpeg = spawn('ffmpeg', args);
     let stderr = '';
     let killed = false;
@@ -130,14 +131,16 @@ function executeFFmpeg(args, timeoutMs = 300000) { // 5 minute default timeout
     const timeout = setTimeout(() => {
       killed = true;
       ffmpeg.kill('SIGKILL');
-      reject(new Error(`FFmpeg timeout after ${timeoutMs}ms`));
+      reject(new Error(`FFmpeg timeout after ${timeoutMs}ms. Command: ${args.slice(0, 5).join(' ')}`));
     }, timeoutMs);
     
     ffmpeg.stderr.on('data', (data) => {
-      stderr += data.toString();
+      const chunk = data.toString();
+      stderr += chunk;
+      
       // Log progress for debugging
-      if (stderr.includes('time=')) {
-        const timeMatch = stderr.match(/time=(\d{2}:\d{2}:\d{2})/);
+      if (chunk.includes('time=')) {
+        const timeMatch = chunk.match(/time=(\d{2}:\d{2}:\d{2})/);
         if (timeMatch) {
           console.log(`FFmpeg progress: ${timeMatch[1]}`);
         }
@@ -149,15 +152,18 @@ function executeFFmpeg(args, timeoutMs = 300000) { // 5 minute default timeout
       if (killed) return; // Already rejected
       
       if (code === 0) {
+        console.log('FFmpeg completed successfully');
         resolve(stderr);
       } else {
-        reject(new Error(`FFmpeg failed with code ${code}: ${stderr}`));
+        console.error(`FFmpeg failed with code ${code}`);
+        reject(new Error(`FFmpeg failed with code ${code}: ${stderr.slice(-500)}`));
       }
     });
     
     ffmpeg.on('error', (error) => {
       clearTimeout(timeout);
       if (!killed) {
+        console.error(`FFmpeg spawn error: ${error.message}`);
         reject(error);
       }
     });
@@ -390,6 +396,7 @@ async function processVideoSegment(jobId, segmentA, videoBPath, layout, partNumb
     
     // Extract audio from segment
     const audioAPath = path.join(TEMP_DIR, `${segmentId}_audioA.aac`);
+    console.log(`Segment ${segmentId}: Extracting audio`);
     await executeFFmpeg([
       '-i', segmentA.path,
       '-vn',
@@ -397,7 +404,7 @@ async function processVideoSegment(jobId, segmentA, videoBPath, layout, partNumb
       '-loglevel', 'error',
       audioAPath,
       '-y'
-    ], 120000);
+    ], 60000); // 1 minute timeout
     
     // Get BGM
     const bgmPath = await getRandomBGM();
@@ -405,17 +412,20 @@ async function processVideoSegment(jobId, segmentA, videoBPath, layout, partNumb
     // Mix audio
     const mixedAudioPath = path.join(TEMP_DIR, `${segmentId}_mixed.aac`);
     if (bgmPath) {
+      console.log(`Segment ${segmentId}: Mixing audio with BGM`);
       await executeFFmpeg([
         '-i', audioAPath,
         '-i', bgmPath,
+        '-t', segmentA.duration.toString(),
         '-filter_complex',
-        `[0:a]volume=1.0[a0];[1:a]volume=0.25[a1];[a0][a1]amix=inputs=2:duration=first`,
+        `[0:a]volume=1.0[a0];[1:a]volume=0.25,aloop=loop=-1:size=2e+09[a1];[a0][a1]amix=inputs=2:duration=shortest`,
         '-ac', '2',
         '-loglevel', 'error',
         mixedAudioPath,
         '-y'
-      ], 120000);
+      ], 60000); // 1 minute timeout
     } else {
+      console.log(`Segment ${segmentId}: No BGM, using original audio`);
       await fs.copyFile(audioAPath, mixedAudioPath);
     }
     
@@ -424,71 +434,77 @@ async function processVideoSegment(jobId, segmentA, videoBPath, layout, partNumb
     const outputWidth = 1080;
     const outputHeight = 1920;
     
+    console.log(`Segment ${segmentId}: Merging videos with layout ${layout}`);
+    
     if (layout === 'A_top_B_bottom') {
       const halfHeight = outputHeight / 2;
       
       await executeFFmpeg([
         '-i', segmentA.path,
+        '-ss', '0',
         '-i', videoBPath,
         '-filter_complex',
         `[0:v]scale=${outputWidth}:${halfHeight}:force_original_aspect_ratio=decrease,pad=${outputWidth}:${halfHeight}:(ow-iw)/2:(oh-ih)/2[top];` +
         `[1:v]scale=${outputWidth}:${halfHeight}:force_original_aspect_ratio=decrease,pad=${outputWidth}:${halfHeight}:(ow-iw)/2:(oh-ih)/2,` +
-        `loop=loop=-1:size=1:start=0,setpts=N/FRAME_RATE/TB[bottom_loop];` +
-        `[top][bottom_loop]vstack=inputs=2[stacked];` +
-        `[stacked]trim=duration=${segmentA.duration}[v]`,
+        `loop=loop=-1:size=1,setpts=N/FRAME_RATE/TB[bottom_loop];` +
+        `[top][bottom_loop]vstack=inputs=2,trim=duration=${segmentA.duration}[v]`,
         '-map', '[v]',
         '-t', segmentA.duration.toString(),
         '-c:v', 'libx264',
-        '-preset', 'veryfast',
-        '-crf', '28',
+        '-preset', 'ultrafast',
+        '-crf', '30',
         '-pix_fmt', 'yuv420p',
         '-loglevel', 'warning',
+        '-an',
         tempMergedPath,
         '-y'
-      ], 300000); // 5 min timeout per segment
+      ], 180000); // 3 minute timeout
     } else if (layout === 'A_left_B_right') {
       const halfWidth = outputWidth / 2;
       
       await executeFFmpeg([
         '-i', segmentA.path,
+        '-ss', '0',
         '-i', videoBPath,
         '-filter_complex',
         `[0:v]scale=${halfWidth}:${outputHeight}:force_original_aspect_ratio=decrease,pad=${halfWidth}:${outputHeight}:(ow-iw)/2:(oh-ih)/2[left];` +
         `[1:v]scale=${halfWidth}:${outputHeight}:force_original_aspect_ratio=decrease,pad=${halfWidth}:${outputHeight}:(ow-iw)/2:(oh-ih)/2,` +
-        `loop=loop=-1:size=1:start=0,setpts=N/FRAME_RATE/TB[right_loop];` +
-        `[left][right_loop]hstack=inputs=2[stacked];` +
-        `[stacked]trim=duration=${segmentA.duration}[v]`,
+        `loop=loop=-1:size=1,setpts=N/FRAME_RATE/TB[right_loop];` +
+        `[left][right_loop]hstack=inputs=2,trim=duration=${segmentA.duration}[v]`,
         '-map', '[v]',
         '-t', segmentA.duration.toString(),
         '-c:v', 'libx264',
-        '-preset', 'veryfast',
-        '-crf', '28',
+        '-preset', 'ultrafast',
+        '-crf', '30',
         '-pix_fmt', 'yuv420p',
         '-loglevel', 'warning',
+        '-an',
         tempMergedPath,
         '-y'
-      ], 300000);
+      ], 180000);
     }
     
     // Add watermark
+    console.log(`Segment ${segmentId}: Adding watermark and audio`);
     const finalOutputPath = path.join(OUTPUT_DIR, `${segmentId}_final.mp4`);
     await executeFFmpeg([
       '-i', tempMergedPath,
       '-i', mixedAudioPath,
       '-filter_complex',
-      `[0:v]drawtext=text='𝘼𝙙𝙫𝙖𝙮254':fontsize=24:fontcolor=white@0.6:x=w-tw-20:y=h-th-20:box=1:boxcolor=black@0.3:boxborderw=5,rotate=10*PI/180:c=none:ow=rotw(10*PI/180):oh=roth(10*PI/180)[v]`,
+      `[0:v]drawtext=text='𝘼𝙙𝙫𝙖𝙮254':fontsize=24:fontcolor=white@0.6:x=w-tw-20:y=h-th-20:box=1:boxcolor=black@0.3:boxborderw=5[v]`,
       '-map', '[v]',
       '-map', '1:a',
       '-c:v', 'libx264',
-      '-preset', 'veryfast',
-      '-crf', '28',
+      '-preset', 'ultrafast',
+      '-crf', '30',
       '-c:a', 'aac',
       '-b:a', '128k',
       '-pix_fmt', 'yuv420p',
+      '-shortest',
       '-loglevel', 'warning',
       finalOutputPath,
       '-y'
-    ], 120000);
+    ], 120000); // 2 minute timeout
     
     // Extract thumbnail
     const thumbnailPath = path.join(OUTPUT_DIR, `${segmentId}_thumb.jpg`);
@@ -546,6 +562,7 @@ async function processVideo(job) {
     
     // Extract audio from Video A
     const audioAPath = path.join(TEMP_DIR, `${jobId}_audioA.aac`);
+    console.log(`Job ${jobId}: Extracting audio from Video A`);
     await executeFFmpeg([
       '-i', videoAPath,
       '-vn',
@@ -553,7 +570,7 @@ async function processVideo(job) {
       '-loglevel', 'error',
       audioAPath,
       '-y'
-    ]);
+    ], 60000); // 1 minute timeout
     
     job.progress = 20;
     await saveJob(job);
@@ -568,13 +585,14 @@ async function processVideo(job) {
       await executeFFmpeg([
         '-i', audioAPath,
         '-i', bgmPath,
+        '-t', durationA.toString(),
         '-filter_complex',
-        `[0:a]volume=1.0[a0];[1:a]volume=0.25[a1];[a0][a1]amix=inputs=2:duration=first`,
+        `[0:a]volume=1.0[a0];[1:a]volume=0.25,aloop=loop=-1:size=2e+09[a1];[a0][a1]amix=inputs=2:duration=shortest`,
         '-ac', '2',
         '-loglevel', 'error',
         mixedAudioPath,
         '-y'
-      ]);
+      ], 60000); // 1 minute timeout
     } else {
       console.log(`Job ${jobId}: No BGM found, using original audio`);
       await fs.copyFile(audioAPath, mixedAudioPath);
@@ -649,20 +667,20 @@ async function processVideo(job) {
       '-i', tempMergedPath,
       '-i', mixedAudioPath,
       '-filter_complex',
-      `[0:v]drawtext=text='𝘼𝙙𝙫𝙖𝙮254':fontsize=24:fontcolor=white@0.6:x=w-tw-20:y=h-th-20:box=1:boxcolor=black@0.3:boxborderw=5,rotate=10*PI/180:c=none:ow=rotw(10*PI/180):oh=roth(10*PI/180)[v]`,
+      `[0:v]drawtext=text='𝘼𝙙𝙫𝙖𝙮254':fontsize=24:fontcolor=white@0.6:x=w-tw-20:y=h-th-20:box=1:boxcolor=black@0.3:boxborderw=5[v]`,
       '-map', '[v]',
       '-map', '1:a',
       '-c:v', 'libx264',
-      '-preset', 'veryfast',
-      '-crf', '28',
+      '-preset', 'ultrafast',
+      '-crf', '30',
       '-c:a', 'aac',
       '-b:a', '128k',
       '-pix_fmt', 'yuv420p',
+      '-shortest',
       '-loglevel', 'warning',
-      '-stats',
       finalOutputPath,
       '-y'
-    ]);
+    ], 120000); // 2 minute timeout
     
     console.log(`Job ${jobId}: Watermark complete`);
     job.progress = 80;
