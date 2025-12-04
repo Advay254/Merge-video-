@@ -119,20 +119,12 @@ async function getRandomBGM() {
   return path.join(BGM_DIR, randomFile);
 }
 
-// Helper: Execute FFmpeg command with timeout
-function executeFFmpeg(args, timeoutMs = 180000) { // 3 minute default timeout
+// Helper: Execute FFmpeg command without timeout
+function executeFFmpeg(args) {
   return new Promise((resolve, reject) => {
     console.log(`FFmpeg command: ffmpeg ${args.join(' ')}`);
     const ffmpeg = spawn('ffmpeg', args);
     let stderr = '';
-    let killed = false;
-    
-    // Set timeout
-    const timeout = setTimeout(() => {
-      killed = true;
-      ffmpeg.kill('SIGKILL');
-      reject(new Error(`FFmpeg timeout after ${timeoutMs}ms. Command: ${args.slice(0, 5).join(' ')}`));
-    }, timeoutMs);
     
     ffmpeg.stderr.on('data', (data) => {
       const chunk = data.toString();
@@ -148,9 +140,6 @@ function executeFFmpeg(args, timeoutMs = 180000) { // 3 minute default timeout
     });
     
     ffmpeg.on('close', (code) => {
-      clearTimeout(timeout);
-      if (killed) return; // Already rejected
-      
       if (code === 0) {
         console.log('FFmpeg completed successfully');
         resolve(stderr);
@@ -161,11 +150,8 @@ function executeFFmpeg(args, timeoutMs = 180000) { // 3 minute default timeout
     });
     
     ffmpeg.on('error', (error) => {
-      clearTimeout(timeout);
-      if (!killed) {
-        console.error(`FFmpeg spawn error: ${error.message}`);
-        reject(error);
-      }
+      console.error(`FFmpeg spawn error: ${error.message}`);
+      reject(error);
     });
   });
 }
@@ -274,6 +260,7 @@ async function processVideoSegments(job) {
   try {
     job.status = 'processing';
     job.progress = 5;
+    job.status_message = 'Getting video metadata...';
     await saveJob(job);
     
     // Get metadata for Video A
@@ -290,7 +277,7 @@ async function processVideoSegments(job) {
       
       // Split Video A into segments
       job.progress = 10;
-      job.status_message = 'Splitting video into parts...';
+      job.status_message = `Splitting ${Math.round(durationA)}s video into parts...`;
       await saveJob(job);
       
       const segmentsA = await splitVideoIntoSegments(videoAPath, durationA, `${jobId}_A`);
@@ -319,7 +306,8 @@ async function processVideoSegments(job) {
           videoBPath,
           layout,
           partNumber,
-          progressBase
+          progressBase,
+          job
         );
         
         results.push(result);
@@ -388,13 +376,16 @@ async function processVideoSegments(job) {
 }
 
 // Process a single segment
-async function processVideoSegment(jobId, segmentA, videoBPath, layout, partNumber, progressBase) {
+async function processVideoSegment(jobId, segmentA, videoBPath, layout, partNumber, progressBase, job) {
   const segmentId = `${jobId}_part${partNumber}`;
   
   try {
     console.log(`Segment ${segmentId}: Starting processing`);
     
     // Extract audio from segment
+    job.status_message = `Part ${partNumber}: Extracting audio...`;
+    await saveJob(job);
+    
     const audioAPath = path.join(TEMP_DIR, `${segmentId}_audioA.aac`);
     console.log(`Segment ${segmentId}: Extracting audio`);
     await executeFFmpeg([
@@ -404,12 +395,15 @@ async function processVideoSegment(jobId, segmentA, videoBPath, layout, partNumb
       '-loglevel', 'error',
       audioAPath,
       '-y'
-    ], 60000); // 1 minute timeout
+    ]);
     
     // Get BGM
     const bgmPath = await getRandomBGM();
     
     // Mix audio
+    job.status_message = `Part ${partNumber}: Mixing audio...`;
+    await saveJob(job);
+    
     const mixedAudioPath = path.join(TEMP_DIR, `${segmentId}_mixed.aac`);
     if (bgmPath) {
       console.log(`Segment ${segmentId}: Mixing audio with BGM`);
@@ -423,13 +417,16 @@ async function processVideoSegment(jobId, segmentA, videoBPath, layout, partNumb
         '-loglevel', 'error',
         mixedAudioPath,
         '-y'
-      ], 60000); // 1 minute timeout
+      ]);
     } else {
       console.log(`Segment ${segmentId}: No BGM, using original audio`);
       await fs.copyFile(audioAPath, mixedAudioPath);
     }
     
     // Merge videos
+    job.status_message = `Part ${partNumber}: Merging videos...`;
+    await saveJob(job);
+    
     const tempMergedPath = path.join(TEMP_DIR, `${segmentId}_merged.mp4`);
     const outputWidth = 1080;
     const outputHeight = 1920;
@@ -458,7 +455,7 @@ async function processVideoSegment(jobId, segmentA, videoBPath, layout, partNumb
         '-an',
         tempMergedPath,
         '-y'
-      ], 180000); // 3 minute timeout
+      ]);
     } else if (layout === 'A_left_B_right') {
       const halfWidth = outputWidth / 2;
       
@@ -481,10 +478,13 @@ async function processVideoSegment(jobId, segmentA, videoBPath, layout, partNumb
         '-an',
         tempMergedPath,
         '-y'
-      ], 180000);
+      ]);
     }
     
     // Add watermark
+    job.status_message = `Part ${partNumber}: Adding watermark...`;
+    await saveJob(job);
+    
     console.log(`Segment ${segmentId}: Adding watermark and audio`);
     const finalOutputPath = path.join(OUTPUT_DIR, `${segmentId}_final.mp4`);
     await executeFFmpeg([
@@ -504,9 +504,11 @@ async function processVideoSegment(jobId, segmentA, videoBPath, layout, partNumb
       '-loglevel', 'warning',
       finalOutputPath,
       '-y'
-    ], 120000); // 2 minute timeout
+    ]);
     
     // Extract thumbnail
+    job.status_message = `Part ${partNumber}: Creating thumbnail...`;
+    await saveJob(job);
     const thumbnailPath = path.join(OUTPUT_DIR, `${segmentId}_thumb.jpg`);
     await extractThumbnail(segmentA.path, thumbnailPath);
     
@@ -563,6 +565,10 @@ async function processVideo(job) {
     // Extract audio from Video A
     const audioAPath = path.join(TEMP_DIR, `${jobId}_audioA.aac`);
     console.log(`Job ${jobId}: Extracting audio from Video A`);
+    
+    job.status_message = 'Extracting audio...';
+    await saveJob(job);
+    
     await executeFFmpeg([
       '-i', videoAPath,
       '-vn',
@@ -570,7 +576,7 @@ async function processVideo(job) {
       '-loglevel', 'error',
       audioAPath,
       '-y'
-    ], 60000); // 1 minute timeout
+    ]);
     
     job.progress = 20;
     await saveJob(job);
@@ -579,6 +585,9 @@ async function processVideo(job) {
     const bgmPath = await getRandomBGM();
     
     // Mix audio
+    job.status_message = 'Mixing audio with background music...';
+    await saveJob(job);
+    
     const mixedAudioPath = path.join(TEMP_DIR, `${jobId}_mixed.aac`);
     if (bgmPath) {
       console.log(`Job ${jobId}: Mixing audio with BGM`);
@@ -592,7 +601,7 @@ async function processVideo(job) {
         '-loglevel', 'error',
         mixedAudioPath,
         '-y'
-      ], 60000); // 1 minute timeout
+      ]);
     } else {
       console.log(`Job ${jobId}: No BGM found, using original audio`);
       await fs.copyFile(audioAPath, mixedAudioPath);
@@ -877,6 +886,11 @@ app.get('/api/job/:id', async (req, res) => {
       status: job.status,
       progress: job.progress
     };
+    
+    // Add status message if available
+    if (job.status_message) {
+      response.status_message = job.status_message;
+    }
     
     if (job.status === 'completed' && job.result) {
       response.result = job.result;
